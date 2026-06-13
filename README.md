@@ -16,7 +16,7 @@
 
 ### 👥 Integrantes (Grupo 4):
 * **Bryan Law** — 8-1011-2459
-* **Evaristo Alvarez** — *(Cédula)*
+* **Evaristo Alvarez** — 8-1005-1928
 * **Fernando Jimenez** — 20-24-7669
 * **Manuel Campos** — 8-1022-1118
 * **Diego Gordon** — 8-1017-349
