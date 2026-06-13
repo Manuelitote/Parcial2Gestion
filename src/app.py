@@ -703,6 +703,5 @@ with tab_ia:
                 2. <b>Enfoque en Datos y Cloud:</b> Implementar electivas específicas en Arquitecturas Cloud (AWS/Azure) y Pipelines de Ingesta de Datos (Data Engineering), alineándose con las tecnologías emergentes identificadas en el modelo predictivo.<br>
                 3. <b>Talleres de Habilidades Técnicas:</b> Habilitar bootcamps intensivos sobre tecnologías de frontend moderno como <b>React</b> y backend en <b>Python</b> o <b>Java (Spring Boot)</b>, minimizando la brecha entre los planes de estudio tradicionales y el ecosistema empresarial panameño.
             </p>
-            <small style="color: #6B7280;"><i>*Nota: Para habilitar el informe redactado por la red neuronal Gemini de Google, configure la variable de entorno GEMINI_API_KEY en su archivo .env local y presione el botón de arriba.</i></small>
         </div>
         """, unsafe_allow_html=True)
