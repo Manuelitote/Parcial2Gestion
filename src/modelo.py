@@ -1,187 +1,221 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """
-Modulo: modelo.py
-Descripción: Script de Machine Learning.
-             1. Clustering (K-Means) de ofertas de empleo basado en habilidades
-                técnicas, agrupándolas en perfiles profesionales de TI.
-             2. Análisis de tendencias y predicción de habilidades emergentes
-                aplicando Regresión Lineal sobre la frecuencia temporal de las tecnologías.
-Autor: Grupo 4 - Gestión de la Información (Semestre I, 2026)
+modelo.py - Machine Learning sobre el mercado laboral IT en Panamá.
+1. K-Means Clustering (TF-IDF + PCA 2D) con Silhouette Score.
+2. Regresión Lineal temporal de habilidades con R² y clasificación de confiabilidad.
+Grupo 4 - Gestión de la Información (Semestre I, 2026)
 """
 
 import os
-import sqlite3
+import logging
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
-import json
+from sklearn.metrics import silhouette_score
 
-# Configuración de Rutas
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_PROC_DIR = os.path.join(BASE_DIR, "data", "processed")
-DB_PATH = os.path.join(DATA_PROC_DIR, "laboral_it.db")
 CSV_PATH = os.path.join(DATA_PROC_DIR, "vacantes_limpias.csv")
-
-# Archivos de salida del modelo
 MODEL_JOBS_PATH = os.path.join(DATA_PROC_DIR, "vacantes_modeladas.csv")
 MODEL_TRENDS_PATH = os.path.join(DATA_PROC_DIR, "tendencias_skills.csv")
 
 
 def cargar_datos() -> pd.DataFrame:
-    """
-    Carga el dataset de vacantes procesadas desde el CSV limpio.
-    Si no existe, notifica que se debe ejecutar primero el pipeline.
-    """
+    """Carga el CSV limpio generado por el pipeline. Lo ejecuta si no existe."""
     if not os.path.exists(CSV_PATH):
-        print("[!] No se encontró el archivo de datos limpios. Ejecutando pipeline primero...")
+        log.info("CSV no encontrado. Ejecutando pipeline primero...")
         from pipeline import ejecutar_pipeline
-        ejecutar_pipeline(modo_simulado=True, num_simulados=200)
-        
+        ejecutar_pipeline(num_simulados=200)
+
     df = pd.read_csv(CSV_PATH)
-    # Rellenar nulos
     df["habilidades"] = df["habilidades"].fillna("")
-    df["salario_min"] = df["salario_min"].fillna(df["salario_min"].median() if not df["salario_min"].isna().all() else 1500.0)
-    df["salario_max"] = df["salario_max"].fillna(df["salario_max"].median() if not df["salario_max"].isna().all() else 2500.0)
+    median_min = df["salario_min"].median() if not df["salario_min"].isna().all() else 1500.0
+    median_max = df["salario_max"].median() if not df["salario_max"].isna().all() else 2500.0
+    df["salario_min"] = df["salario_min"].fillna(median_min)
+    df["salario_max"] = df["salario_max"].fillna(median_max)
     df["experiencia_anios"] = df["experiencia_anios"].fillna(2)
     return df
 
 
 # =====================================================================
-# 1. Clustering de Ofertas IT (K-Means + PCA)
+# 1. Clustering K-Means con Silhouette Score y etiquetas únicas
 # =====================================================================
+
+# Posibles etiquetas y sus palabras clave para scoring
+_ETIQUETAS_CLUSTER = {
+    "Frontend / UI Web": ["react", "html", "css", "angular", "vue", "javascript", "typescript", "ui"],
+    "Data & Analytics / BI": ["python", "sql", "power", "bi", "tableau", "excel", "data", "spark", "r"],
+    "DevOps & Cloud": ["aws", "docker", "kubernetes", "cloud", "linux", "azure", "terraform", "jenkins"],
+    "Backend / Core Systems": ["java", "net", "spring", "node", "postgresql", "mysql", "api", "php", "c#"],
+}
+
+
+def _asignar_etiquetas_unicas(n_clusters: int, order_centroids, terms) -> dict:
+    """Asigna etiquetas únicas a cada cluster usando un scoring greedy.
+    Garantiza que dos clusters nunca reciban la misma etiqueta.
+    """
+    # Calcular puntaje de cada cluster para cada etiqueta
+    scores: dict[int, dict[str, int]] = {}
+    for i in range(n_clusters):
+        top_terms = [terms[ind].lower() for ind in order_centroids[i, :10]]
+        scores[i] = {}
+        for label, keywords in _ETIQUETAS_CLUSTER.items():
+            scores[i][label] = sum(1 for kw in keywords if any(kw in t for t in top_terms))
+
+    # Si hay más clusters que etiquetas predefinidas, generar etiquetas genéricas de respaldo
+    etiquetas_disponibles = list(_ETIQUETAS_CLUSTER.keys())
+    while len(etiquetas_disponibles) < n_clusters:
+        etiquetas_disponibles.append(f"Perfil IT #{len(etiquetas_disponibles) + 1}")
+
+    # Asignación greedy: primero asignar el cluster con mejor puntaje total
+    cluster_labels: dict[int, str] = {}
+    usadas: set[str] = set()
+
+    cluster_order = sorted(range(n_clusters), key=lambda x: max(scores[x].values(), default=0), reverse=True)
+
+    for i in cluster_order:
+        disponibles = [l for l in etiquetas_disponibles if l not in usadas]
+        mejor = max(disponibles, key=lambda l: scores[i].get(l, 0))
+        cluster_labels[i] = mejor
+        usadas.add(mejor)
+
+    return cluster_labels
+
+
 def ejecutar_clustering(df: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
     """
-    Agrupa las ofertas en base a sus habilidades requeridas.
-    Usa TF-IDF para vectorizar el listado de habilidades de cada vacante,
-    luego K-Means para agruparlas, y PCA para visualización 2D.
+    K-Means con TF-IDF sobre habilidades, reducción PCA 2D para visualización.
+    Reporta Silhouette Score para justificar la calidad del agrupamiento.
+    Las etiquetas de cluster son únicas (sin repetición entre clusters).
     """
-    print(f"[*] Iniciando K-Means Clustering con k={n_clusters} clusters...")
-    
-    # Preparar el "texto" de habilidades (reemplazar comas por espacios para el vectorizador)
+    log.info(f"K-Means Clustering con k={n_clusters}...")
+
     skills_text = df["habilidades"].str.replace(",", " ")
-    
-    # Vectorización TF-IDF
-    vectorizer = TfidfVectorizer(token_pattern=r'(?u)\b[\w\.\#\-]+\b') # Capturar C#, .NET, C++
+    vectorizer = TfidfVectorizer(token_pattern=r'(?u)\b[\w\.\#\-]+\b')
     tfidf_matrix = vectorizer.fit_transform(skills_text)
-    
-    # Ajustar Modelo K-Means
+
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     df["cluster"] = kmeans.fit_predict(tfidf_matrix)
-    
-    # Reducción de dimensionalidad con PCA para visualización en 2D en el Dashboard
+
+    # Silhouette Score (métrica de calidad del clustering, rango [-1, 1])
+    sil = silhouette_score(tfidf_matrix, df["cluster"], metric="cosine")
+    log.info(f"Silhouette Score (cosine): {sil:.4f}  [0.2-0.5 = estructura débil, >0.5 = buena]")
+    df["silhouette_score"] = round(float(sil), 4)
+
+    # PCA 2D para visualización
     pca = PCA(n_components=2, random_state=42)
     pca_coords = pca.fit_transform(tfidf_matrix.toarray())
     df["pca_x"] = pca_coords[:, 0]
     df["pca_y"] = pca_coords[:, 1]
-    
-    # Identificar palabras/habilidades clave de cada cluster para nombrarlos
+
+    # Etiquetas únicas por cluster
     terms = vectorizer.get_feature_names_out()
-    cluster_labels = {}
-    
-    print("\n[+] Análisis de Centroides (Top Habilidades por Cluster):")
     order_centroids = kmeans.cluster_centers_.argsort()[:, ::-1]
+
+    log.info("Top habilidades por cluster:")
     for i in range(n_clusters):
-        top_terms = [terms[ind] for ind in order_centroids[i, :4]]
-        print(f"    Cluster {i}: Claves principales -> {', '.join(top_terms)}")
-        # Asignar un nombre sugerido al cluster según sus palabras clave dominantes
-        if any(w in ["react", "html", "css", "angular", "vue", "javascript"] for w in [t.lower() for t in top_terms]):
-            label = "Frontend / UI Web"
-        elif any(w in ["python", "sql", "power", "bi", "tableau", "excel", "data"] for w in [t.lower() for t in top_terms]):
-            label = "Data & Analytics / BI"
-        elif any(w in ["aws", "docker", "kubernetes", "cloud", "linux", "azure"] for w in [t.lower() for t in top_terms]):
-            label = "DevOps & Cloud Infrastructure"
-        else:
-            label = "Backend / Java / Core Systems"
-        cluster_labels[i] = label
-        
+        top = [terms[ind] for ind in order_centroids[i, :5]]
+        log.info(f"  Cluster {i}: {', '.join(top)}")
+
+    cluster_labels = _asignar_etiquetas_unicas(n_clusters, order_centroids, terms)
     df["nombre_cluster"] = df["cluster"].map(cluster_labels)
-    print(f"[+] Clustering finalizado. Coordenadas PCA y etiquetas generadas.\n")
+
+    log.info("Clustering finalizado.\n")
     return df
 
 
 # =====================================================================
-# 2. Predicción de Habilidades Emergentes (Regresión Lineal Temporal)
+# 2. Regresión Lineal Temporal con R² y manejo de rango corto
 # =====================================================================
 def predecir_habilidades_emergentes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Agrupa las ofertas por periodos quincenales (15 días) y calcula la
-    frecuencia porcentual de menciones de cada tecnología.
-    Ajusta una regresión lineal para calcular la pendiente (crecimiento/tendencia)
-    y proyecta la demanda futura para estimar las habilidades emergentes.
+    Analiza la frecuencia temporal de habilidades y ajusta una regresión lineal.
+    - Agrupa por semana si el rango de fechas < 90 días (snapshot corto).
+    - Agrupa por quincena si el rango ≥ 90 días.
+    - Calcula R² de cada regresión; si R² < 0.2, marca la tendencia como 'No confiable'.
+    - Si hay muy pocos puntos temporales, reporta honestamente.
     """
-    print("[*] Ejecutando análisis de tendencias y predicción con Regresión Lineal...")
-    
-    # Convertir fecha a datetime
+    log.info("Análisis de tendencias con Regresión Lineal...")
+
     df["fecha"] = pd.to_datetime(df["fecha_publicacion"])
-    
-    # Desglosar habilidades en filas individuales
+
+    # Desglosar habilidades en filas
     habilidades_desglosadas = []
-    for idx, row in df.iterrows():
-        skills = [s.strip() for s in row["habilidades"].split(",") if s.strip()]
+    for _, row in df.iterrows():
+        skills = [s.strip() for s in str(row["habilidades"]).split(",") if s.strip()]
         for skill in skills:
             habilidades_desglosadas.append({
                 "id_vacante": row["id"],
                 "fecha": row["fecha"],
-                "habilidad": skill
+                "habilidad": skill,
             })
-            
+
     df_skills = pd.DataFrame(habilidades_desglosadas)
-    
-    # Agrupar las fechas en periodos de 15 días (bi-semanal) para tener suficientes puntos de datos
-    # Mapear cada fecha al índice del periodo (0 a N)
+    if df_skills.empty:
+        log.warning("Sin habilidades para analizar tendencias.")
+        return pd.DataFrame()
+
+    # Determinar granularidad según rango de fechas disponible
+    rango_dias = (df_skills["fecha"].max() - df_skills["fecha"].min()).days
+    periodo_dias = 7 if rango_dias < 90 else 15
+    granularidad = "semanal" if periodo_dias == 7 else "quincenal"
+    log.info(f"Rango de fechas: {rango_dias} dias -> agrupacion {granularidad} (periodo={periodo_dias}d).")
+
     fecha_min = df_skills["fecha"].min()
-    df_skills["periodo_id"] = ((df_skills["fecha"] - fecha_min).dt.days // 15).astype(int)
-    
-    # Obtener el número total de vacantes por periodo quincenal en la base completa
-    df["periodo_id"] = ((df["fecha"] - fecha_min).dt.days // 15).astype(int)
+    df_skills["periodo_id"] = ((df_skills["fecha"] - fecha_min).dt.days // periodo_dias).astype(int)
+    df["periodo_id"] = ((df["fecha"] - fecha_min).dt.days // periodo_dias).astype(int)
+
     vacantes_por_periodo = df.groupby("periodo_id").size().to_dict()
-    
-    # Frecuencia absoluta de habilidades por periodo
     frecuencia_periodo = df_skills.groupby(["habilidad", "periodo_id"]).size().reset_index(name="conteo")
-    
-    # Calcular porcentaje de presencia de la habilidad respecto al total de vacantes del periodo
+
     def calcular_pct(row):
-        total_vacantes = vacantes_por_periodo.get(row["periodo_id"], 1)
-        return (row["conteo"] / total_vacantes) * 100
-        
+        total = vacantes_por_periodo.get(row["periodo_id"], 1)
+        return (row["conteo"] / total) * 100
+
     frecuencia_periodo["porcentaje"] = frecuencia_periodo.apply(calcular_pct, axis=1)
-    
-    # Lista de habilidades únicas con suficiente presencia (aparecer al menos 5 veces)
-    habilidades_populares = df_skills["habilidad"].value_counts()[df_skills["habilidad"].value_counts() >= 5].index.tolist()
-    
+
+    habilidades_populares = (
+        df_skills["habilidad"].value_counts()[df_skills["habilidad"].value_counts() >= 5].index.tolist()
+    )
+
     tendencias = []
-    max_periodo = df_skills["periodo_id"].max()
-    
+    max_periodo = int(df_skills["periodo_id"].max())
+    n_periodos = max_periodo + 1
+
     for skill in habilidades_populares:
-        # Filtrar datos de la habilidad
         datos_skill = frecuencia_periodo[frecuencia_periodo["habilidad"] == skill]
-        
-        # Rellenar con 0 los periodos donde la habilidad no apareció
-        todos_los_periodos = pd.DataFrame({"periodo_id": range(max_periodo + 1)})
+
+        todos_los_periodos = pd.DataFrame({"periodo_id": range(n_periodos)})
         datos_completos = pd.merge(todos_los_periodos, datos_skill, on="periodo_id", how="left")
         datos_completos["porcentaje"] = datos_completos["porcentaje"].fillna(0.0)
         datos_completos["habilidad"] = skill
-        
-        # Ajustar Regresión Lineal
+
         X = datos_completos["periodo_id"].values.reshape(-1, 1)
         y = datos_completos["porcentaje"].values
-        
+
         model = LinearRegression()
         model.fit(X, y)
-        
-        pendiente = model.coef_[0]  # La pendiente de la recta indica si sube o baja la demanda
-        intercepto = model.intercept_
-        
-        # Predecir frecuencia para el próximo periodo (max_periodo + 1)
-        proxima_demanda_pred = max(0.0, float(model.predict([[max_periodo + 1]])[0]))
-        
-        # Clasificar la tendencia
-        if pendiente > 0.3:
+
+        pendiente = float(model.coef_[0])
+        intercepto = float(model.intercept_)
+        r2 = float(model.score(X, y))
+
+        # Predicción sin warning: usar numpy array con reshape correcto
+        proxima_demanda_pred = max(0.0, float(model.predict(np.array([[max_periodo + 1]]))[0]))
+
+        # Clasificar tendencia; si R² < 0.2 la regresión no es confiable
+        if n_periodos < 3:
+            estado_tendencia = "No confiable / Pocos periodos"
+        elif r2 < 0.2:
+            estado_tendencia = "No confiable / Pocos datos"
+        elif pendiente > 0.3:
             estado_tendencia = "Emergente / Crecimiento Rápido"
         elif pendiente > 0.05:
             estado_tendencia = "Crecimiento Estable"
@@ -189,53 +223,51 @@ def predecir_habilidades_emergentes(df: pd.DataFrame) -> pd.DataFrame:
             estado_tendencia = "En Declive"
         else:
             estado_tendencia = "Madura / Estable"
-            
+
         tendencias.append({
             "habilidad": skill,
-            "pendiente": float(pendiente),
-            "intercepto": float(intercepto),
+            "pendiente": pendiente,
+            "intercepto": intercepto,
+            "r2": round(r2, 4),
             "porcentaje_actual": float(y[-1]) if len(y) > 0 else 0.0,
             "porcentaje_predicho_futuro": proxima_demanda_pred,
-            "tendencia": estado_tendencia
+            "tendencia": estado_tendencia,
+            "granularidad": granularidad,
+            "n_periodos": n_periodos,
         })
-        
+
     df_tendencias = pd.DataFrame(tendencias).sort_values(by="pendiente", ascending=False)
-    
-    print("\n[+] Top 5 Habilidades Emergentes Predictivas en Panamá:")
-    for idx, row in df_tendencias.head(5).iterrows():
-        print(f"    - {row['habilidad']}: Pendiente de Crecimiento = {row['pendiente']:.3f} | Estado: {row['tendencia']}")
-        
+
+    log.info("Top 5 Habilidades Emergentes:")
+    for _, row in df_tendencias.head(5).iterrows():
+        log.info(f"  {row['habilidad']}: pendiente={row['pendiente']:.3f} | R²={row['r2']:.3f} | {row['tendencia']}")
+
     return df_tendencias
 
 
 # =====================================================================
-# Función Principal de Machine Learning
+# Pipeline principal de ML
 # =====================================================================
 def ejecutar_modelado():
-    """
-    Ejecuta el pipeline de ciencia de datos completo:
-    Carga de datos, agrupamiento K-Means, análisis y regresión temporal,
-    y guardado de datasets de salida procesados para el Dashboard.
-    """
-    print("======================================================================")
-    print("               EJECUTANDO MODELADO DE MACHINE LEARNING                ")
-    print("======================================================================")
-    
-    # 1. Cargar Datos
+    """Carga datos, ejecuta K-Means y Regresión Lineal, guarda CSVs de salida."""
+    log.info("=" * 70)
+    log.info("            MODELADO DE MACHINE LEARNING - GRUPO 4 UTP")
+    log.info("=" * 70)
+
     df = cargar_datos()
-    
-    # 2. K-Means Clustering
+    log.info(f"Datos cargados: {len(df)} vacantes.")
+
     df_clustered = ejecutar_clustering(df, n_clusters=4)
     df_clustered.to_csv(MODEL_JOBS_PATH, index=False, encoding="utf-8-sig")
-    print(f"[+] Archivo guardado con clusters en: {MODEL_JOBS_PATH}")
-    
-    # 3. Regresión Temporal de Tendencias
+    log.info(f"Vacantes modeladas guardadas: {MODEL_JOBS_PATH}")
+
     df_tendencias = predecir_habilidades_emergentes(df_clustered)
-    df_tendencias.to_csv(MODEL_TRENDS_PATH, index=False, encoding="utf-8-sig")
-    print(f"[+] Archivo de tendencias guardado en: {MODEL_TRENDS_PATH}")
-    
-    print("\n[+] Fase de Machine Learning completada exitosamente.")
-    print("======================================================================\n")
+    if not df_tendencias.empty:
+        df_tendencias.to_csv(MODEL_TRENDS_PATH, index=False, encoding="utf-8-sig")
+        log.info(f"Tendencias guardadas: {MODEL_TRENDS_PATH}")
+
+    log.info("Modelado completado exitosamente.")
+    log.info("=" * 70)
 
 
 if __name__ == "__main__":

@@ -201,7 +201,7 @@ st.markdown("""
 # =====================================================================
 # Cargar Datos y Manejar Fallbacks
 # =====================================================================
-@st.cache_data
+@st.cache_data(ttl=600)
 def cargar_datos_dashboard():
     """
     Carga los archivos generados por la fase de ML.
@@ -230,9 +230,9 @@ if df_jobs is None or df_trends is None:
                 # Ejecutar pipeline y modelo programáticamente
                 from pipeline import ejecutar_pipeline
                 from modelo import ejecutar_modelado
-                
-                # Ejecutar
-                ejecutar_pipeline(modo_simulado=True, num_simulados=200)
+
+                # Flujo "real primero, simulado de respaldo"
+                ejecutar_pipeline(num_simulados=200)
                 ejecutar_modelado()
                 
                 st.success("🎉 ¡Proceso finalizado con éxito! Cargando el Dashboard...")
@@ -242,32 +242,28 @@ if df_jobs is None or df_trends is None:
     st.stop()
 
 
-def asegurar_logo_local():
+def obtener_logo_local():
+    """Retorna la ruta del logo si existe localmente. NO descarga nada de internet
+    para evitar cuelgues al iniciar en Streamlit Cloud."""
     logo_path = os.path.join(BASE_DIR, "src", "logo_utp.png")
-    if not os.path.exists(logo_path):
-        try:
-            import requests
-            url = "https://utp.ac.pa/sites/default/files/logo_utp.png"
-            headers = {"User-Agent": "Mozilla/5.0"}
-            r = requests.get(url, headers=headers, timeout=5)
-            if r.status_code == 200:
-                with open(logo_path, "wb") as f:
-                    f.write(r.content)
-        except Exception as e:
-            pass
     return logo_path if os.path.exists(logo_path) else None
 
 
 # =====================================================================
 # Estructuración de la Barra Lateral (Filtros)
 # =====================================================================
-logo_local = asegurar_logo_local()
+logo_local = obtener_logo_local()
 if logo_local:
     st.sidebar.image(logo_local, width=90)
 else:
     st.sidebar.markdown("🏫 **UTP - FISC**")
 st.sidebar.title("Filtros del Mercado")
 st.sidebar.markdown("Use los controles inferiores para filtrar las ofertas de empleo e interactuar con los modelos.")
+
+# Botón para limpiar la caché tras re-ejecutar el pipeline (evita datos viejos)
+if st.sidebar.button("🔄 Recargar datos"):
+    st.cache_data.clear()
+    st.rerun()
 
 # 1. Búsqueda de Texto
 search_query = st.sidebar.text_input("Buscar puesto (Ej: React, Backend)", "")
@@ -392,6 +388,17 @@ df_filtrado = df_filtrado[
 # Fila de Encabezado
 st.markdown('<div class="main-header">Análisis del Mercado Laboral IT en Panamá</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Segundo Parcial - Gestión de la Información | Facultad de Ingeniería de Sistemas Computacionales (UTP)</div>', unsafe_allow_html=True)
+
+# Indicador visible del origen de los datos (reales vs simulados)
+if "es_simulado" in df_jobs.columns:
+    n_sim = int(df_jobs["es_simulado"].fillna(0).astype(int).sum())
+    n_real = len(df_jobs) - n_sim
+    if n_real > 0 and n_sim == 0:
+        st.success(f"🟢 **Origen de datos:** {n_real} registros reales (scraping + API pública) · 0 simulados.")
+    elif n_real > 0 and n_sim > 0:
+        st.info(f"🔵 **Origen de datos:** {n_real} reales (scraping + API pública) + {n_sim} simulados de respaldo.")
+    else:
+        st.warning(f"🟡 **Origen de datos:** {n_sim} registros simulados (no se obtuvieron datos reales en esta corrida).")
 
 # Fila 1: Tarjetas de Métricas Clave
 col1, col2, col3, col4 = st.columns(4)
@@ -531,7 +538,23 @@ with tab_clusters:
         Esta sección aplica la técnica no supervisada de **K-Means Clustering** en base a la similitud de habilidades requeridas en las ofertas de empleo.
         Los datos de alta dimensionalidad (habilidades vectorizadas por TF-IDF) se proyectan en dos dimensiones utilizando **PCA (Análisis de Componentes Principales)** para poder visualizarlos en un plano cartesiano interactivo.
     """)
-    
+
+    # Silhouette Score: evidencia de la calidad/rigor del agrupamiento
+    if "silhouette_score" in df_jobs.columns and len(df_jobs) > 0:
+        sil = float(df_jobs["silhouette_score"].iloc[0])
+        if sil >= 0.5:
+            calidad = "buena separación entre perfiles"
+        elif sil >= 0.2:
+            calidad = "estructura débil pero presente"
+        else:
+            calidad = "clusters poco definidos (solapados)"
+        st.metric(
+            "Silhouette Score del Clustering",
+            f"{sil:.4f}",
+            help="Métrica de calidad del K-Means. Rango [-1, 1]: >0.5 buena, 0.2-0.5 débil, <0.2 pobre."
+        )
+        st.caption(f"Interpretación: {calidad}.")
+
     if len(df_filtrado) > 0:
         # Gráfico interactivo de dispersión PCA
         fig_pca = px.scatter(
@@ -587,22 +610,29 @@ with tab_clusters:
 with tab_emergentes:
     st.subheader("Predicción y Análisis de Habilidades Emergentes")
     st.markdown("""
-        Esta sección analiza la demanda temporal de las tecnologías en los últimos 6 meses.
-        Ajustamos un modelo de **Regresión Lineal** ($y = mx + b$) para cada habilidad, donde la pendiente ($m$) representa la tasa de crecimiento quincenal de su demanda.
-        Una **pendiente positiva alta** revela habilidades emergentes (con fuerte tendencia de adopción en Panamá).
+        Esta sección analiza la demanda temporal de las tecnologías usando las **fechas de publicación reales** capturadas en el scraping.
+        Ajustamos un modelo de **Regresión Lineal** ($y = mx + b$) por habilidad, donde la pendiente ($m$) es la tasa de crecimiento por periodo (semanal o quincenal según el rango de fechas disponible).
+        El **R²** mide la confiabilidad del ajuste: si es bajo (< 0.2) o hay pocos periodos, la tendencia se marca como *no confiable* en lugar de afirmarla.
     """)
+
+    if "granularidad" in df_trends.columns and len(df_trends) > 0:
+        gran = df_trends["granularidad"].iloc[0]
+        n_per = int(df_trends["n_periodos"].iloc[0]) if "n_periodos" in df_trends.columns else 0
+        st.caption(f"Agrupación temporal usada: **{gran}** · {n_per} periodos analizados.")
     
     # Mostrar tabla de tendencias estimadas por el modelo de Regresión
     col_t1, col_t2 = st.columns([1, 1])
     
     with col_t1:
         st.markdown("### Clasificación de Tendencias Predictivas")
+        cols_trend = [c for c in ["habilidad", "pendiente", "r2", "porcentaje_actual", "porcentaje_predicho_futuro", "tendencia"] if c in df_trends.columns]
         st.dataframe(
-            df_trends[["habilidad", "pendiente", "porcentaje_actual", "porcentaje_predicho_futuro", "tendencia"]],
+            df_trends[cols_trend],
             use_container_width=True,
             column_config={
                 "habilidad": "Habilidad",
                 "pendiente": st.column_config.NumberColumn("Tasa de Crecimiento (m)", format="%.3f"),
+                "r2": st.column_config.NumberColumn("R² (confiabilidad)", format="%.3f"),
                 "porcentaje_actual": st.column_config.NumberColumn("Frecuencia Actual (%)", format="%.1f %%"),
                 "porcentaje_predicho_futuro": st.column_config.NumberColumn("Demanda Proyectada (%)", format="%.1f %%"),
                 "tendencia": "Clasificación de Tendencia"

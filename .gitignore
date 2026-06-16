@@ -1,0 +1,23 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Variables de entorno / secretos (NO subir la API Key de Gemini)
+.env
+.env.*
+!.env.example
+
+# Artefactos de depuracion del scraping (HTML crudo)
+data/raw/*.html
+
+# Sistema operativo / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

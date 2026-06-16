@@ -96,23 +96,31 @@ Una ventana de tu navegador predeterminada se abrirá automáticamente en la dir
 ## ⚙️ 5. Cómo Funcionan los Componentes
 
 ### A. Ingesta y Estructuración (`pipeline.py`)
-1. **Web Scraping:** Emplea `requests` y `BeautifulSoup` para extraer las ofertas bajo el término "tecnología". Cuenta con un **generador temporal sintético de fallback** con datos del mercado panameño (Copa Airlines, Banco General, etc.) que permite que el pipeline corra inmediatamente sin fallar por bloqueos de Cloudflare.
-2. **Procesamiento de LLM:** Utiliza la API de Gemini para analizar la oferta cruda y extraer un objeto estructurado JSON con las habilidades técnicas específicas, los salarios máximos/mínimos y la experiencia requerida, guardándolos en la base de datos relacional SQLite (`data/processed/laboral_it.db`) y exportándolos a un archivo CSV consolidado.
+1. **Web Scraping (real primero):** Emplea `cloudscraper` + `BeautifulSoup` para intentar superar el muro anti-bot de Cloudflare en *Computrabajo* y *Konzerta*. Cada función prueba múltiples selectores CSS y, si la estructura del portal cambió, falla limpio registrando el motivo (guarda el HTML crudo en `data/raw/` para depuración).
+2. **API pública de respaldo:** Si el scraping no alcanza el mínimo de registros reales, consulta la **API pública de Arbeitnow** (`arbeitnow.com/api/job-board-api`), con *RemoteOK* como segundo respaldo. Estas fuentes entregan ofertas IT reales (algunas remotas/internacionales) sin autenticación, garantizando que el pipeline siempre tenga datos auténticos.
+3. **Generador sintético (último recurso):** Solo si los datos reales son insuficientes (< 30 registros), se completa con un generador sintético del mercado panameño (Copa Airlines, Banco General, etc.). Las habilidades se asignan **sin sesgo temporal artificial** para no contaminar el análisis de tendencias.
+4. **Procesamiento de LLM:** Cada vacante real pasa por la API de Gemini (o un parser heurístico local si no hay API Key) para extraer un objeto JSON con habilidades técnicas, salarios y experiencia, guardándolos en SQLite (`data/processed/laboral_it.db`) y exportándolos a CSV.
+
+> **Trazabilidad del origen:** Todos los registros llevan la columna booleana **`es_simulado`** (`False` = dato real de scraping/API, `True` = sintético). El dashboard muestra un banner con el conteo de registros reales vs. simulados.
 
 ### B. Machine Learning (`modelo.py`)
-1. **K-Means Clustering:** Convierte las habilidades a una matriz numérica usando TF-IDF. Agrupa las ofertas en 4 clusters correspondientes a perfiles profesionales (e.g. *Frontend / UI Web*, *Data & Analytics*, *DevOps*, *Backend / Core Systems*). Aplica **PCA** para reducir las dimensiones a 2D para graficarlas.
-2. **Regresión Lineal (Habilidades Emergentes):** Agrupa las vacantes en periodos quincenales, calcula la frecuencia porcentual de cada tecnología y ajusta una regresión lineal. La **pendiente ($m$)** determina la tasa de crecimiento quincenal de la habilidad, prediciendo cuáles tendrán mayor demanda a futuro.
+1. **K-Means Clustering:** Convierte las habilidades a una matriz numérica usando TF-IDF. Agrupa las ofertas en 4 clusters de perfiles profesionales (e.g. *Frontend / UI Web*, *Data & Analytics*, *DevOps & Cloud*, *Backend / Core Systems*) con **etiquetas únicas** (ningún cluster repite nombre). Reporta el **Silhouette Score** como evidencia de la calidad del agrupamiento y aplica **PCA** para visualizar en 2D.
+2. **Regresión Lineal (Habilidades Emergentes):** Agrupa las vacantes por periodos según las **fechas de publicación reales** capturadas en el scraping: **semanal** si el rango de fechas es corto (< 90 días, típico de un *snapshot*) o **quincenal** si es más amplio. Ajusta una regresión lineal por habilidad y reporta su **R²**; si el R² < 0.2 o hay muy pocos periodos, la "tendencia" se marca como **no confiable** en lugar de afirmarla. La **pendiente ($m$)** indica la tasa de crecimiento por periodo.
+
+> **Honestidad metodológica:** El análisis temporal depende de las fechas reales disponibles. Con datos reales de un solo *snapshot* el rango será corto y muchas tendencias se reportarán como *no confiables* — esto es intencional y honesto. El dataset sintético distribuye fechas en ~6 meses pero sin inyectar tendencias artificiales, por lo que cualquier pendiente observada es producto del azar, no de un sesgo programado.
 
 ---
 
 ## 🛠️ 6. Ejecución del Pipeline Completo (Opcional)
 
-Si deseas forzar una nueva extracción de datos del scraping y reentrenar los modelos de machine learning, ejecuta en tu terminal con el entorno virtual activo:
+Si deseas forzar una nueva extracción de datos y reentrenar los modelos, ejecuta en tu terminal con el entorno virtual activo:
 ```bash
-python src/pipeline.py
-python src/modelo.py
+python src/pipeline.py    # Intenta scraping real + API; completa con sintéticos solo si faltan datos
+python src/modelo.py      # Reentrena K-Means (Silhouette) y Regresión Lineal (R²)
 ```
-*(Nota: El dashboard de Streamlit también cuenta con un botón en la interfaz para ejecutar este paso automáticamente si deseas ver nuevos datos).*
+El pipeline ahora opera en modo **"real primero, simulado de respaldo"**: primero intenta Computrabajo + Konzerta (cloudscraper) y la API pública de Arbeitnow/RemoteOK; solo si reúne menos de 30 registros reales completa con el generador sintético. La consola informa cuántos registros reales vs. simulados obtuvo.
+
+*(Nota: El dashboard de Streamlit también cuenta con un botón para ejecutar este paso, y un botón **🔄 Recargar datos** en la barra lateral para limpiar la caché tras una nueva corrida).*
 
 ---
 
