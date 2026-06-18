@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 pipeline.py - Ingesta y preprocesamiento de datos del mercado IT en Panamá.
-Flujo: scraping real (Computrabajo + Konzerta + Arbeitnow API) → LLM (Gemini/heurístico)
-       → SQLite + CSV. Si los datos reales son insuficientes (<30), completa con simulados.
+Flujo: scraping real (Computrabajo + Konzerta) + APIs (Arbeitnow paginada → RemoteOK)
+       → LLM (Gemini/heurístico) → SQLite + CSV.
+Versión combinada: la API de Arbeitnow se pagina para maximizar datos reales, y
+siempre se añade un bloque de simulados etiquetados (es_simulado) para garantizar
+profundidad temporal de ~6 meses en el análisis de tendencias.
 Grupo 4 - Gestión de la Información (Semestre I, 2026)
 """
 
@@ -305,36 +308,49 @@ def fetch_arbeitnow_api() -> List[Dict[str, Any]]:
 
     try:
         import requests
-        resp = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        # UPDATE (version combinada): paginar la API de Arbeitnow para obtener
+        # MAS datos reales. Antes se consultaba una sola pagina (~8 vacantes IT
+        # tras filtrar); ahora se recorren varias paginas (?page=N) acumulando
+        # resultados, lo que multiplica la cantidad de vacantes reales obtenidas.
+        MAX_PAGINAS_ARBEITNOW = 5
+        for pagina in range(1, MAX_PAGINAS_ARBEITNOW + 1):
+            resp = requests.get(
+                f"https://www.arbeitnow.com/api/job-board-api?page={pagina}",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            registros = data.get("data", [])
+            if not registros:
+                break  # no hay mas paginas: cortar
 
-        for job in data.get("data", [])[:60]:
-            titulo = job.get("title", "")
-            if not titulo or not any(kw in titulo.lower() for kw in tech_keywords):
-                continue
+            for job in registros:
+                titulo = job.get("title", "")
+                if not titulo or not any(kw in titulo.lower() for kw in tech_keywords):
+                    continue
 
-            descripcion_raw = job.get("description", f"Vacante de {titulo}.")
-            desc_limpia = BeautifulSoup(descripcion_raw, "html.parser").get_text(separator=" ", strip=True)[:600]
+                descripcion_raw = job.get("description", f"Vacante de {titulo}.")
+                desc_limpia = BeautifulSoup(descripcion_raw, "html.parser").get_text(separator=" ", strip=True)[:600]
 
-            fecha_pub = datetime.date.today().isoformat()
-            created_at = job.get("created_at")
-            if created_at:
-                try:
-                    fecha_pub = datetime.datetime.fromtimestamp(int(created_at)).date().isoformat()
-                except Exception:
-                    pass
+                fecha_pub = datetime.date.today().isoformat()
+                created_at = job.get("created_at")
+                if created_at:
+                    try:
+                        fecha_pub = datetime.datetime.fromtimestamp(int(created_at)).date().isoformat()
+                    except Exception:
+                        pass
 
-            vacantes.append({
-                "titulo_original": titulo,
-                "empresa": job.get("company_name", "Empresa Internacional"),
-                "descripcion": desc_limpia,
-                "portal": "Arbeitnow API",
-                "fecha_publicacion": fecha_pub,
-                "es_simulado": False,
-            })
+                vacantes.append({
+                    "titulo_original": titulo,
+                    "empresa": job.get("company_name", "Empresa Internacional"),
+                    "descripcion": desc_limpia,
+                    "portal": "Arbeitnow API",
+                    "fecha_publicacion": fecha_pub,
+                    "es_simulado": False,
+                })
+            time.sleep(0.4)  # cortesia con la API publica entre paginas
 
-        log.info(f"Arbeitnow API: {len(vacantes)} vacantes IT obtenidas.")
+        log.info(f"Arbeitnow API: {len(vacantes)} vacantes IT obtenidas (paginado, {pagina} pag).")
 
     except Exception as e:
         log.error(f"Arbeitnow API falló: {e}. Intentando RemoteOK...")
@@ -803,16 +819,24 @@ def ejecutar_pipeline(num_simulados: int = 150):
                 "es_simulado": False,
             })
 
-    # --- FASE 4: Completar con simulados si faltan datos ---
+    # --- FASE 4: Añadir simulados para PROFUNDIDAD TEMPORAL ---
+    # UPDATE (versión combinada): los datos reales capturados en vivo solo abarcan
+    # unos pocos días, insuficiente para analizar tendencias temporales de meses.
+    # Por eso SIEMPRE añadimos un bloque de simulados etiquetados (es_simulado=1)
+    # que aportan ~6 meses de histórico, además de conservar TODOS los reales
+    # (es_simulado=0). Así el dataset combina autenticidad (más reales gracias a la
+    # paginación de Arbeitnow) y profundidad temporal (simulados) para que tanto el
+    # clustering como el análisis de tendencias funcionen.
     if registros_reales < MIN_REGISTROS_REALES:
-        faltantes = max(num_simulados - len(vacantes_procesadas), 1)
-        log.info(
-            f"Fase 4: Solo {registros_reales} registros reales (mínimo={MIN_REGISTROS_REALES}). "
-            f"Completando con {faltantes} simulados..."
+        log.warning(
+            f"Fase 4: Pocos datos reales ({registros_reales} < {MIN_REGISTROS_REALES}); "
+            f"el dataset dependerá sobre todo de los simulados."
         )
-        vacantes_procesadas.extend(generate_panama_mock_data(num_records=faltantes))
-    else:
-        log.info(f"Suficientes datos reales ({registros_reales}). No se usarán simulados.")
+    log.info(
+        f"Fase 4: Añadiendo {num_simulados} simulados etiquetados para profundidad temporal "
+        f"(además de {registros_reales} reales)..."
+    )
+    vacantes_procesadas.extend(generate_panama_mock_data(num_records=num_simulados))
 
     # --- FASE 5: Guardar ---
     reales = sum(1 for v in vacantes_procesadas if not v.get("es_simulado"))
@@ -828,4 +852,4 @@ def ejecutar_pipeline(num_simulados: int = 150):
 
 
 if __name__ == "__main__":
-    ejecutar_pipeline(num_simulados=200)
+    ejecutar_pipeline(num_simulados=150)

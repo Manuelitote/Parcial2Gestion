@@ -8,6 +8,14 @@
 
 ---
 
+> ### 🔧 Mejoras de la versión combinada
+> Esta versión integra dos mejoras sobre el flujo de datos para obtener **más datos reales sin perder el análisis de tendencias**:
+>
+> 1. **Paginación de la API de Arbeitnow:** antes se consultaba una sola página (~8 vacantes IT tras filtrar); ahora se recorren varias páginas, elevando la ingesta real a ~80–95 vacantes por corrida (sumadas a las de Computrabajo vía cloudscraper).
+> 2. **Profundidad temporal garantizada:** como los datos reales en vivo solo cubren pocos días, el pipeline **siempre** añade un bloque de simulados etiquetados (`es_simulado`) que aportan ~6 meses de histórico. Así el dataset combina autenticidad (reales) y profundidad temporal (para que la Regresión Lineal detecte habilidades emergentes).
+
+---
+
 ### 🏫 Universidad Tecnológica de Panamá (UTP)
 * **Facultad:** Facultad de Ingeniería de Sistemas Computacionales (FISC)
 * **Carrera:** Licenciatura en Desarrollo y Gestión de Software
